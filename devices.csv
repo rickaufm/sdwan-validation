@@ -1,0 +1,3 @@
+hostname,serial_number,system_ip
+BR-ZURICH-01,XXXXXXXXXXXX,10.10.10.1
+BR-BERN-01,XXXXXXXXXXXX,10.10.10.2
