@@ -310,3 +310,11 @@ Logout sends `GET /logout`.
 | Cellular Status shows **FAIL** | Cellular interfaces found but none is active — check SIM, APN, or signal |
 | Cellular Status shows **N/A** | No cellular interface data returned — device may not have a cellular modem, or `CHECK_CELLULAR=False` |
 | All checks show **N/A** after Reachability FAIL | `ENFORCE_REACHABILITY=True` (default) — set to `False` to run checks regardless |
+
+---
+
+## Example Validation Report
+
+The screenshot below shows a real report output with two devices — one with a WARN status (BFD sessions not yet established) and one fully passing all checks, including Cellular Status showing N/A for a device without a cellular interface.
+
+![Example Validation Report](example_report.png)
