@@ -1430,6 +1430,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       cursor: pointer;
     }
     .expand-bar button:hover { background: rgba(255,255,255,.12); }
+    .expand-bar button.active-toggle {
+      background: rgba(220,80,80,.18);
+      border-color: #e05555;
+      color: #f08080;
+    }
+    .expand-bar button.active-toggle:hover { background: rgba(220,80,80,.28); }
     .search-wrap {
       margin-left: auto;
       position: relative;
@@ -1512,6 +1518,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <div class="expand-bar">
     <button onclick="toggleAll(true)">&#9654; Expand All</button>
     <button onclick="toggleAll(false)">&#9664; Collapse All</button>
+    <button id="btnHideUnreachable" onclick="toggleUnreachable(this)">&#128683; Hide Unreachable</button>
     <div class="search-wrap">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
         <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
@@ -1526,6 +1533,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   {% for dev in devices %}
   <div class="dev-card"
        data-status="{{ dev.overall_status }}"
+       data-reachable="{{ '0' if dev.checks.get('Device Reachability', {}).get('status') == 'FAIL' else '1' }}"
        data-search="{{ (dev.hostname ~ " " ~ dev.system_ip ~ " " ~ dev.serial_number ~ " " ~ dev.site_name ~ " " ~ dev.site_id ~ " " ~ dev.device_model) | lower }}"
        onclick="toggleCard(this)">
     <div class="dev-card-hdr">
@@ -1594,15 +1602,20 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         else card.classList.remove("expanded");
       });
     }
-    function searchDevices(query) {
-      var q = query.trim().toLowerCase();
-      var cards = document.querySelectorAll(".dev-card");
+
+    // ── Central visibility state ──────────────────────────────────────
+    var activeFilter      = "all";
+    var hideUnreachable   = false;
+
+    function applyVisibility() {
+      var searchEl = document.getElementById("deviceSearch");
+      var q = searchEl ? searchEl.value.trim().toLowerCase() : "";
       var shown = 0;
-      cards.forEach(function(card) {
-        var haystack = card.getAttribute("data-search") || "";
-        var statusMatch = (activeFilter === "all" || card.getAttribute("data-status") === activeFilter);
-        var textMatch   = (q === "" || haystack.indexOf(q) !== -1);
-        var visible = statusMatch && textMatch;
+      document.querySelectorAll(".dev-card").forEach(function(card) {
+        var statusMatch     = (activeFilter === "all" || card.getAttribute("data-status") === activeFilter);
+        var textMatch       = (q === "" || (card.getAttribute("data-search") || "").indexOf(q) !== -1);
+        var reachableMatch  = (!hideUnreachable || card.getAttribute("data-reachable") === "1");
+        var visible = statusMatch && textMatch && reachableMatch;
         card.style.display = visible ? "" : "none";
         if (visible) shown++;
       });
@@ -1610,35 +1623,26 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       if (countEl) countEl.textContent = q ? shown + " result" + (shown !== 1 ? "s" : "") : "";
     }
 
-    var activeFilter = "all";
+    function searchDevices(query) {
+      applyVisibility();
+    }
+
     function filterCards(status, btn) {
-      // Toggle off if same filter clicked again
-      if (activeFilter === status && status !== "all") {
-        status = "all";
-      }
+      if (activeFilter === status && status !== "all") status = "all";
       activeFilter = status;
-      // Update active highlight on summary cards
-      document.querySelectorAll(".sum-card").forEach(function(c) {
-        c.classList.remove("active");
-      });
+      document.querySelectorAll(".sum-card").forEach(function(c) { c.classList.remove("active"); });
       if (btn) btn.classList.add("active");
       if (status === "all" && btn) btn.classList.remove("active");
-      // Show/hide device cards — respect active search query too
-      var searchEl = document.getElementById("deviceSearch");
-      var q = searchEl ? searchEl.value.trim().toLowerCase() : "";
-      document.querySelectorAll(".dev-card").forEach(function(card) {
-        var s = card.getAttribute("data-status");
-        var haystack = card.getAttribute("data-search") || "";
-        var statusMatch = (status === "all" || s === status);
-        var textMatch   = (q === "" || haystack.indexOf(q) !== -1);
-        card.style.display = (statusMatch && textMatch) ? "" : "none";
-      });
-      // Update search result count
-      var countEl = document.getElementById("searchCount");
-      if (countEl && q) {
-        var shown = document.querySelectorAll(".dev-card:not([style*='none'])").length;
-        countEl.textContent = shown + " result" + (shown !== 1 ? "s" : "");
-      }
+      applyVisibility();
+    }
+
+    function toggleUnreachable(btn) {
+      hideUnreachable = !hideUnreachable;
+      btn.classList.toggle("active-toggle", hideUnreachable);
+      btn.innerHTML = hideUnreachable
+        ? "&#128683; Show Unreachable"
+        : "&#128683; Hide Unreachable";
+      applyVisibility();
     }
   </script>
 </body>
