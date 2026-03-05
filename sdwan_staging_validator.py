@@ -1533,7 +1533,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   {% for dev in devices %}
   <div class="dev-card"
        data-status="{{ dev.overall_status }}"
-       data-reachable="{{ '0' if dev.checks.get('Device Reachability', {}).get('status') == 'FAIL' else '1' }}"
+       data-reachable="{{ '0' if (dev.error or dev.checks.get('Device Reachability', {}).get('status') == 'FAIL') else '1' }}"
        data-search="{{ (dev.hostname ~ " " ~ dev.system_ip ~ " " ~ dev.serial_number ~ " " ~ dev.site_name ~ " " ~ dev.site_id ~ " " ~ dev.device_model) | lower }}"
        onclick="toggleCard(this)">
     <div class="dev-card-hdr">
