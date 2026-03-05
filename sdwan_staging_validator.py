@@ -3,10 +3,15 @@
 =============================================================================
 Cisco Catalyst SD-WAN Staging Validation Script
 =============================================================================
-Author      : Ricardo Kaufmann
+Author      : Ricardo (Cisco SE / SD-WAN SME)
 Description : Validates the staging/ZTP provisioning process for SD-WAN
               WAN Edge routers by querying the SD-WAN Manager REST API.
-              Reads device list from a CSV file and generates an HTML report.
+              Supports two device selection modes:
+                • CSV mode  (--csv devices.csv) — explicit device list from file
+                • Manager mode (no --csv)       — dynamic device list from Manager,
+                  controlled by SCOPE config variable:
+                    "all"     → validate every registered WAN Edge device
+                    "staging" → validate only devices carrying the STAGING_TAG tag
 
 Checks performed per device:
   1. Configuration-Group deployment status
@@ -18,7 +23,8 @@ Checks performed per device:
   7. Software version
 
 Usage:
-  python sdwan_staging_validator.py --csv devices.csv
+  python sdwan_staging_validator.py --csv devices.csv   # CSV mode
+  python sdwan_staging_validator.py                       # Manager mode (SCOPE="all" or "staging")
 
 CSV format (header row required):
   hostname,serial_number,system_ip
@@ -55,7 +61,7 @@ from jinja2 import Template
 VMANAGE_HOST     = "192.168.1.1"       # SD-WAN Manager IP or hostname
 VMANAGE_PORT     = 443                 # SD-WAN Manager HTTPS port (usually 443 or 8443)
 VMANAGE_USERNAME = "admin"             # SD-WAN Manager username
-VMANAGE_PASSWORD = "C1sco12345!"       # SD-WAN Manager password
+VMANAGE_PASSWORD = "admin"             # SD-WAN Manager password
 
 # Set to True to ignore untrusted/self-signed TLS certificates (lab/staging use)
 DISABLE_SSL_VERIFY = True
@@ -69,6 +75,11 @@ ENFORCE_REACHABILITY    = True         # True = skip all checks and mark FAIL if
 EXPECTED_TLOC_COLORS    = None         # Optional list of required TLOC colors, e.g. ["lte", "private1"]. None = skip check
 EXPECTED_SW_VERSION     = None         # Set e.g. "17.12.1a" to enforce, or None to skip check
 CHECK_CELLULAR          = False        # True = add Cellular Status check (interface, APN, IP, RAT); False = skip
+
+# ── Manager-driven device scope (used only when --csv is NOT provided) ──────
+SCOPE       = "staging"   # "all"     → validate every registered WAN Edge device
+                          # "staging" → validate only devices with the STAGING_TAG tag
+STAGING_TAG = "staging"   # Tag name to filter on when SCOPE = "staging"
 
 # Output HTML report filename
 OUTPUT_HTML = "sdwan_staging_report.html"
@@ -553,8 +564,9 @@ class DeviceResult:
         self.system_ip      = system_ip
         self.site_id        = ""
         self.site_name      = ""
-        self.device_model   = ""
-        self.checks         = {}   # {check_name: {"status": ..., "value": ..., "detail": ...}}
+        self.device_model        = ""
+        self.last_deployed_raw   = ""   # ISO-like string for sorting, e.g. "2026-02-24 13:46:25"
+        self.checks              = {}   # {check_name: {"status": ..., "value": ..., "detail": ...}}
         self.overall_status = self.PASS
         self.error          = None
 
@@ -687,6 +699,20 @@ def validate_device(
                     last_deployed = last_entry[:40]
             else:
                 last_deployed = last_entry[:60]
+
+        # ── Convert last_deployed to a sortable ISO-style string ────────
+        last_deployed_iso = ""
+        if last_deployed and last_deployed != "N/A":
+            import re as _re
+            _MONTHS = {"jan":"01","feb":"02","mar":"03","apr":"04","may":"05","jun":"06",
+                       "jul":"07","aug":"08","sep":"09","oct":"10","nov":"11","dec":"12"}
+            # e.g. "24-Feb-2026 13:46:25 CET" or "24-Feb-2026 13:46:25"
+            _m = _re.match(r'(\d{1,2})-(\w{3})-(\d{4})\s+(\d{2}:\d{2}:\d{2})', last_deployed)
+            if _m:
+                _d, _mo, _y, _t = _m.groups()
+                _mo_n = _MONTHS.get(_mo.lower(), "00")
+                last_deployed_iso = f"{_y}-{_mo_n}-{_d.zfill(2)} {_t}"
+        result.last_deployed_raw = last_deployed_iso
 
         detail = f"Last deployed: {last_deployed}  |  {config_msg or 'N/A'}"
 
@@ -1137,6 +1163,73 @@ def read_devices_from_csv(csv_path: str) -> list:
     return devices
 
 
+def _device_has_tag(inv_device: dict, tag_name: str) -> bool:
+    """
+    Check whether a /dataservice/device inventory record carries a given tag.
+    Tags are stored as: "tags": [{"name": "staging", "type": "USER", ...}, ...]
+    """
+    tags = inv_device.get("tags", [])
+    if not isinstance(tags, list):
+        return False
+    return any(
+        isinstance(t, dict) and t.get("name", "").lower() == tag_name.lower()
+        for t in tags
+    )
+
+
+def read_devices_from_manager(client: "SDWANManagerClient",
+                               all_devices: list,
+                               vedge_devices: list) -> list:
+    """
+    Build the device list dynamically from the Manager inventory.
+    SCOPE = "all"     → return every registered WAN Edge device.
+    SCOPE = "staging" → return only devices whose inventory record
+                        carries the STAGING_TAG tag (field: "tags").
+
+    Tags are read from the "tags" field of GET /dataservice/device —
+    no separate API call is required.
+
+    Returns a list of dicts with keys: hostname, serial_number, system_ip
+    (same schema as read_devices_from_csv, so validate_device() is unchanged).
+    """
+    if SCOPE.lower() == "staging":
+        # Filter inventory to devices carrying the staging tag
+        tagged = [d for d in all_devices if _device_has_tag(d, STAGING_TAG)]
+        print(f"[*] Filtering by tag \"{STAGING_TAG}\" from inventory ...")
+        print(f"    → {len(tagged)} device(s) carry tag \"{STAGING_TAG}\".")
+        if not tagged:
+            print(f"[!] No devices found with tag \"{STAGING_TAG}\". "
+                  f"Assign the tag in SD-WAN Manager and retry.")
+            sys.exit(1)
+        source = tagged
+    else:
+        source = all_devices   # all WAN Edge devices
+
+    # Build a serial → system-ip lookup from the vedge list for fallback
+    vedge_by_hostname = {v.get("host-name", ""): v for v in vedge_devices}
+
+    devices = []
+    for inv in source:
+        hostname  = (inv.get("host-name") or inv.get("hostname") or "").strip()
+        system_ip = (inv.get("system-ip") or inv.get("deviceId") or "").strip()
+        # Serial: prefer board-serial from inventory; fall back to vedge record
+        serial = (inv.get("board-serial") or "").strip()
+        if not serial:
+            vedge = vedge_by_hostname.get(hostname, {})
+            serial = (vedge.get("serialNumber") or "").strip()
+
+        if not system_ip or not hostname:
+            continue   # skip incomplete records
+
+        devices.append({
+            "hostname":      hostname,
+            "serial_number": serial,
+            "system_ip":     system_ip,
+        })
+
+    return devices
+
+
 # =============================================================================
 # HTML Report Generator
 # =============================================================================
@@ -1322,8 +1415,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     /* ── Expand-all bar ─────────────────────── */
     .expand-bar {
       display: flex;
+      align-items: center;
       gap: 10px;
       margin-bottom: 18px;
+      flex-wrap: wrap;
     }
     .expand-bar button {
       background: rgba(255,255,255,.06);
@@ -1335,6 +1430,37 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       cursor: pointer;
     }
     .expand-bar button:hover { background: rgba(255,255,255,.12); }
+    .search-wrap {
+      margin-left: auto;
+      position: relative;
+      display: flex;
+      align-items: center;
+    }
+    .search-wrap svg {
+      position: absolute;
+      left: 10px;
+      opacity: 0.45;
+      pointer-events: none;
+    }
+    #deviceSearch {
+      background: rgba(255,255,255,.06);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--head);
+      font-size: 13px;
+      padding: 6px 12px 6px 34px;
+      width: 280px;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    #deviceSearch::placeholder { color: rgba(255,255,255,.3); }
+    #deviceSearch:focus { border-color: var(--cisco); }
+    #searchCount {
+      font-size: 11px;
+      color: rgba(255,255,255,.4);
+      margin-left: 8px;
+      white-space: nowrap;
+    }
 
     .pill {
       display: inline-block;
@@ -1382,15 +1508,26 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <div class="sum-card" onclick="filterCards('WARN', this)"><div class="num c-warn">{{ warned }}</div><div class="lbl">Warnings</div></div>
   </div>
 
-  <!-- ── Expand / Collapse All ── -->
+  <!-- ── Toolbar: Expand / Collapse + Search ── -->
   <div class="expand-bar">
     <button onclick="toggleAll(true)">&#9654; Expand All</button>
     <button onclick="toggleAll(false)">&#9664; Collapse All</button>
+    <div class="search-wrap">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+      </svg>
+      <input id="deviceSearch" type="text" placeholder="Search hostname, IP, serial, site…"
+             oninput="searchDevices(this.value)" autocomplete="off" />
+      <span id="searchCount"></span>
+    </div>
   </div>
 
   <!-- ── Device Results ── -->
   {% for dev in devices %}
-  <div class="dev-card" data-status="{{ dev.overall_status }}" onclick="toggleCard(this)">
+  <div class="dev-card"
+       data-status="{{ dev.overall_status }}"
+       data-search="{{ (dev.hostname ~ " " ~ dev.system_ip ~ " " ~ dev.serial_number ~ " " ~ dev.site_name ~ " " ~ dev.site_id ~ " " ~ dev.device_model) | lower }}"
+       onclick="toggleCard(this)">
     <div class="dev-card-hdr">
       <button class="toggle-btn" onclick="event.stopPropagation(); toggleCard(this.closest('.dev-card'))">&#9654;</button>
       <span class="dev-hostname">{{ dev.hostname }}</span>
@@ -1457,6 +1594,22 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         else card.classList.remove("expanded");
       });
     }
+    function searchDevices(query) {
+      var q = query.trim().toLowerCase();
+      var cards = document.querySelectorAll(".dev-card");
+      var shown = 0;
+      cards.forEach(function(card) {
+        var haystack = card.getAttribute("data-search") || "";
+        var statusMatch = (activeFilter === "all" || card.getAttribute("data-status") === activeFilter);
+        var textMatch   = (q === "" || haystack.indexOf(q) !== -1);
+        var visible = statusMatch && textMatch;
+        card.style.display = visible ? "" : "none";
+        if (visible) shown++;
+      });
+      var countEl = document.getElementById("searchCount");
+      if (countEl) countEl.textContent = q ? shown + " result" + (shown !== 1 ? "s" : "") : "";
+    }
+
     var activeFilter = "all";
     function filterCards(status, btn) {
       // Toggle off if same filter clicked again
@@ -1470,11 +1623,22 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       });
       if (btn) btn.classList.add("active");
       if (status === "all" && btn) btn.classList.remove("active");
-      // Show/hide device cards
+      // Show/hide device cards — respect active search query too
+      var searchEl = document.getElementById("deviceSearch");
+      var q = searchEl ? searchEl.value.trim().toLowerCase() : "";
       document.querySelectorAll(".dev-card").forEach(function(card) {
         var s = card.getAttribute("data-status");
-        card.style.display = (status === "all" || s === status) ? "" : "none";
+        var haystack = card.getAttribute("data-search") || "";
+        var statusMatch = (status === "all" || s === status);
+        var textMatch   = (q === "" || haystack.indexOf(q) !== -1);
+        card.style.display = (statusMatch && textMatch) ? "" : "none";
       });
+      // Update search result count
+      var countEl = document.getElementById("searchCount");
+      if (countEl && q) {
+        var shown = document.querySelectorAll(".dev-card:not([style*='none'])").length;
+        countEl.textContent = shown + " result" + (shown !== 1 ? "s" : "");
+      }
     }
   </script>
 </body>
@@ -1490,18 +1654,25 @@ def generate_html_report(results: list, output_path: str) -> None:
 
     devices_data = [
         {
-            "hostname":       r.hostname,
-            "serial_number":  r.serial_number,
-            "system_ip":      r.system_ip,
-            "site_id":        r.site_id,
-            "site_name":      r.site_name,
-            "device_model":   r.device_model,
-            "overall_status": r.overall_status,
-            "error":          r.error,
-            "checks":         r.checks,
+            "hostname":          r.hostname,
+            "serial_number":     r.serial_number,
+            "system_ip":         r.system_ip,
+            "site_id":           r.site_id,
+            "site_name":         r.site_name,
+            "device_model":      r.device_model,
+            "last_deployed_raw": r.last_deployed_raw,
+            "overall_status":    r.overall_status,
+            "error":             r.error,
+            "checks":            r.checks,
         }
         for r in results
     ]
+
+    # Sort by most recent Config-Group deployment (devices with no date sink to bottom)
+    devices_data.sort(
+        key=lambda d: d["last_deployed_raw"] or "0000-00-00 00:00:00",
+        reverse=True
+    )
 
     html = Template(HTML_TEMPLATE).render(
         generated_at  = datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1747,9 +1918,11 @@ Example rows:
     )
     parser.add_argument(
         "--csv",
-        required = True,
+        required = False,
+        default  = None,
         metavar  = "DEVICES.CSV",
-        help     = "Path to CSV file containing device list",
+        help     = "Path to CSV file (CSV mode). "
+                   "Omit to use Manager-driven mode (controlled by SCOPE config variable).",
     )
     parser.add_argument(
         "--output",
@@ -1766,17 +1939,23 @@ Example rows:
     args = parser.parse_args()
 
     # ── Banner ──
+    # ── Determine operating mode ──
+    csv_mode = args.csv is not None
+    if csv_mode:
+        mode_label = f"CSV  ({args.csv})"
+    elif SCOPE.lower() == "staging":
+        mode_label = f"Manager / STAGING  (tag: \"{STAGING_TAG}\")"
+    else:
+        mode_label = "Manager / ALL  (every registered WAN Edge)"
+
     print("=" * 65)
     print("  Cisco Catalyst SD-WAN — Staging Validation Tool")
     print("=" * 65)
     print(f"  Manager   : {VMANAGE_HOST}:{VMANAGE_PORT}")
     print(f"  SSL Verify: {'Disabled (untrusted cert mode)' if DISABLE_SSL_VERIFY else 'Enabled'}")
-    print(f"  CSV File  : {args.csv}")
+    print(f"  Mode      : {mode_label}")
     print(f"  Output    : {args.output}")
     print("=" * 65 + "\n")
-
-    # ── Load CSV ──
-    csv_devices = read_devices_from_csv(args.csv)
 
     # ── Connect to SD-WAN Manager ──
     client = SDWANManagerClient(
@@ -1809,6 +1988,21 @@ Example rows:
     except Exception as e:
         print(f"[!] Failed to fetch vEdge list: {e}")
         vedge_devices = []
+
+    # ── Load device list (CSV or Manager-driven) ──
+    if csv_mode:
+        csv_devices = read_devices_from_csv(args.csv)
+    else:
+        csv_devices = read_devices_from_manager(client, all_devices, vedge_devices)
+        scope_desc = (
+            f"tag \"{STAGING_TAG}\"" if SCOPE.lower() == "staging"
+            else "all WAN Edge devices"
+        )
+        print(f"[+] {len(csv_devices)} device(s) selected from Manager ({scope_desc}).")
+        if not csv_devices:
+            print("[!] No devices to validate. Exiting.")
+            client.logout()
+            sys.exit(0)
 
     # ── Debug-fields mode ──
     if args.debug_fields:
