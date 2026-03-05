@@ -1508,10 +1508,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
   <!-- ── Summary ── -->
   <div class="summary-bar">
-    <div class="sum-card" onclick="filterCards('all', this)"><div class="num c-total">{{ total }}</div><div class="lbl">Total Devices</div></div>
-    <div class="sum-card" onclick="filterCards('PASS', this)"><div class="num c-pass">{{ passed }}</div><div class="lbl">All Checks Passed</div></div>
-    <div class="sum-card" onclick="filterCards('FAIL', this)"><div class="num c-fail">{{ failed }}</div><div class="lbl">Checks Failed</div></div>
-    <div class="sum-card" onclick="filterCards('WARN', this)"><div class="num c-warn">{{ warned }}</div><div class="lbl">Warnings</div></div>
+    <div class="sum-card" onclick="filterCards('all', this)"><div class="num c-total" id="cnt-total">{{ total }}</div><div class="lbl">Total Devices</div></div>
+    <div class="sum-card" onclick="filterCards('PASS', this)"><div class="num c-pass" id="cnt-pass">{{ passed }}</div><div class="lbl">All Checks Passed</div></div>
+    <div class="sum-card" onclick="filterCards('FAIL', this)"><div class="num c-fail" id="cnt-fail">{{ failed }}</div><div class="lbl">Checks Failed</div></div>
+    <div class="sum-card" onclick="filterCards('WARN', this)"><div class="num c-warn" id="cnt-warn">{{ warned }}</div><div class="lbl">Warnings</div></div>
   </div>
 
   <!-- ── Toolbar: Expand / Collapse + Search ── -->
@@ -1610,15 +1610,30 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     function applyVisibility() {
       var searchEl = document.getElementById("deviceSearch");
       var q = searchEl ? searchEl.value.trim().toLowerCase() : "";
-      var shown = 0;
+      var shown = 0, cPass = 0, cFail = 0, cWarn = 0;
       document.querySelectorAll(".dev-card").forEach(function(card) {
         var statusMatch     = (activeFilter === "all" || card.getAttribute("data-status") === activeFilter);
         var textMatch       = (q === "" || (card.getAttribute("data-search") || "").indexOf(q) !== -1);
         var reachableMatch  = (!hideUnreachable || card.getAttribute("data-reachable") === "1");
         var visible = statusMatch && textMatch && reachableMatch;
         card.style.display = visible ? "" : "none";
-        if (visible) shown++;
+        if (visible) {
+          shown++;
+          var s = card.getAttribute("data-status");
+          if (s === "PASS") cPass++;
+          else if (s === "FAIL") cFail++;
+          else if (s === "WARN") cWarn++;
+        }
       });
+      // Update summary counters
+      var elTotal = document.getElementById("cnt-total");
+      var elPass  = document.getElementById("cnt-pass");
+      var elFail  = document.getElementById("cnt-fail");
+      var elWarn  = document.getElementById("cnt-warn");
+      if (elTotal) elTotal.textContent = shown;
+      if (elPass)  elPass.textContent  = cPass;
+      if (elFail)  elFail.textContent  = cFail;
+      if (elWarn)  elWarn.textContent  = cWarn;
       var countEl = document.getElementById("searchCount");
       if (countEl) countEl.textContent = q ? shown + " result" + (shown !== 1 ? "s" : "") : "";
     }
