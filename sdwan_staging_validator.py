@@ -75,6 +75,9 @@ ENFORCE_REACHABILITY    = True         # True = skip all checks and mark FAIL if
 EXPECTED_TLOC_COLORS    = None         # Optional list of required TLOC colors, e.g. ["lte", "private1"]. None = skip check
 EXPECTED_SW_VERSION     = None         # Set e.g. "17.12.1a" to enforce, or None to skip check
 CHECK_CELLULAR          = False        # True = add Cellular Status check (interface, APN, IP, RAT); False = skip
+CHECK_CELLULAR_PROFILE  = False        # Expected cellular active-profile ID to enforce, e.g. 15.
+                                       # False = skip profile validation.
+                                       # If set, Cellular Status is WARN when active profile does not match.
 
 # ── Manager-driven device scope (used only when --csv is NOT provided) ──────
 SCOPE       = "staging"   # "all"     → validate every registered WAN Edge device
@@ -1102,12 +1105,31 @@ def validate_device(
                 f"Interface: {iface}  |  APN: {apn}  |  "
                 f"IPv4: {ipv4}  |  Profile: {profile}  |  Uptime: {uptime}"
             )
-            result.add_check(
-                "Cellular Status",
-                DeviceResult.PASS,
-                "Active ✓",
-                detail,
-            )
+            # Optional profile ID validation
+            if CHECK_CELLULAR_PROFILE is not False and str(CHECK_CELLULAR_PROFILE) != "false":
+                expected_profile = str(CHECK_CELLULAR_PROFILE)
+                actual_profile   = str(profile)
+                if actual_profile == expected_profile:
+                    result.add_check(
+                        "Cellular Status",
+                        DeviceResult.PASS,
+                        "Active ✓",
+                        f"{detail}  |  Profile OK (expected: {expected_profile})",
+                    )
+                else:
+                    result.add_check(
+                        "Cellular Status",
+                        DeviceResult.WARN,
+                        "Active ⚠",
+                        f"{detail}  |  Profile mismatch — expected: {expected_profile}",
+                    )
+            else:
+                result.add_check(
+                    "Cellular Status",
+                    DeviceResult.PASS,
+                    "Active ✓",
+                    detail,
+                )
         else:
             # Interfaces found but none is active
             ifaces = ", ".join(
