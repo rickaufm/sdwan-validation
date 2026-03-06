@@ -78,6 +78,10 @@ CHECK_CELLULAR          = False        # True = add Cellular Status check (inter
 CHECK_CELLULAR_PROFILE  = False        # Expected cellular active-profile ID to enforce, e.g. 15.
                                        # False = skip profile validation.
                                        # If set, Cellular Status is WARN when active profile does not match.
+CHECK_DEFAULT_VERSION   = False        # True = verify that defaultVersion == current-partition on each device.
+                                       # Catches routers where the upgrade was activated but the default
+                                       # boot partition was never set — a reboot would roll them back.
+                                       # Source: GET /dataservice/device/action/install/devices/vedge?groupId=all
 
 # ── Manager-driven device scope (used only when --csv is NOT provided) ──────
 SCOPE       = "staging"   # "all"     → validate every registered WAN Edge device
@@ -408,6 +412,15 @@ class SDWANManagerClient:
         except Exception as e:
             return {"_error": str(e)}
 
+    def get_install_devices(self) -> list:
+        """Fetch partition/default-version info for all WAN Edge devices.
+        GET /dataservice/device/action/install/devices/vedge?groupId=all
+        Returns a list of device dicts each containing at minimum:
+          local-system-ip, current-partition, defaultVersion
+        """
+        resp = self._get("/device/action/install/devices/vedge?groupId=all")
+        return resp.get("data", []) if isinstance(resp, dict) else []
+
     def get_cellular_connection(self, system_ip: str) -> list:
         """
         GET /dataservice/device/cellular/connection?deviceId=<system-ip>
@@ -599,6 +612,8 @@ ALL_CHECK_NAMES = [
     "Device Health",
     "Software Version",
 ]
+if CHECK_DEFAULT_VERSION:
+    ALL_CHECK_NAMES.append("Default Version")
 if CHECK_CELLULAR:
     ALL_CHECK_NAMES.append("Cellular Status")
 
@@ -611,10 +626,11 @@ def _fill_na(result: DeviceResult, detail: str = "N/A") -> None:
 
 
 def validate_device(
-    client:        SDWANManagerClient,
-    csv_device:    dict,
-    all_devices:   list,
-    vedge_devices: list,
+    client:           SDWANManagerClient,
+    csv_device:       dict,
+    all_devices:      list,
+    vedge_devices:    list,
+    install_devices:  list,
 ) -> DeviceResult:
     """Run all staging validation checks for a single device."""
 
@@ -1066,7 +1082,53 @@ def validate_device(
         )
 
     # =========================================================================
-    # CHECK 8 — Cellular Status  (only when CHECK_CELLULAR = True)
+    # CHECK 8 — Default Version  (only when CHECK_DEFAULT_VERSION = True)
+    # Source: GET /device/action/install/devices/vedge?groupId=all
+    # Verifies that defaultVersion == current-partition, confirming the post-
+    # upgrade "set default" step was completed in SD-WAN Manager.
+    # =========================================================================
+    if CHECK_DEFAULT_VERSION:
+        install_rec = next(
+            (d for d in install_devices
+             if d.get("local-system-ip") == system_ip
+             or d.get("system-ip") == system_ip),
+            None,
+        )
+        if install_rec is None:
+            result.add_check(
+                "Default Version",
+                DeviceResult.NA,
+                "N/A",
+                "Device not found in install/devices endpoint",
+            )
+        else:
+            current   = install_rec.get("current-partition", "N/A")
+            default_v = install_rec.get("defaultVersion",    "N/A")
+            if current == "N/A" or default_v == "N/A":
+                result.add_check(
+                    "Default Version",
+                    DeviceResult.NA,
+                    "N/A",
+                    f"Partition data unavailable — current: {current}  |  default: {default_v}",
+                )
+            elif current == default_v:
+                result.add_check(
+                    "Default Version",
+                    DeviceResult.PASS,
+                    default_v,
+                    f"Default partition matches running version ({current})",
+                )
+            else:
+                result.add_check(
+                    "Default Version",
+                    DeviceResult.FAIL,
+                    default_v,
+                    f"Default partition not set — running: {current}  |  default: {default_v}  |  "
+                    f"A reboot would roll back to {default_v}",
+                )
+
+    # =========================================================================
+    # CHECK 9 — Cellular Status  (only when CHECK_CELLULAR = True)
     # Source: GET /device/cellular/connection
     # Active interface: packet-session-status-active AND (uptime != "-" OR
     #                   tx-bytes > 0 OR rx-bytes > 0)
@@ -2030,6 +2092,16 @@ Example rows:
         print(f"[!] Failed to fetch vEdge list: {e}")
         vedge_devices = []
 
+    install_devices = []
+    if CHECK_DEFAULT_VERSION:
+        print("[*] Fetching partition info (GET /dataservice/device/action/install/devices/vedge?groupId=all) ...")
+        try:
+            install_devices = client.get_install_devices()
+            print(f"    → {len(install_devices)} device(s) returned.")
+        except Exception as e:
+            print(f"[!] Failed to fetch install/devices data: {e}")
+            install_devices = []
+
     # ── Load device list (CSV or Manager-driven) ──
     if csv_mode:
         csv_devices = read_devices_from_csv(args.csv)
@@ -2066,7 +2138,7 @@ Example rows:
         print(f"  [{idx:>3}/{len(csv_devices)}]  {hostname}  (System IP: {csv_device['system_ip']})")
 
         try:
-            result = validate_device(client, csv_device, all_devices, vedge_devices)
+            result = validate_device(client, csv_device, all_devices, vedge_devices, install_devices)
         except Exception as e:
             result = DeviceResult(
                 csv_device["hostname"],
